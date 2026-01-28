@@ -3,29 +3,24 @@ export default async function handler(req, res) {
     // ---- Inputs from Vanilla ----
     const q = (req.query.q ?? req.query.query ?? "").toString();
     const perPage = Math.min(Number(req.query.perPage ?? 10), 50);
-
-    // Vanilla may send a numeric page. We return it back as currentPage.
-    // If Vanilla doesn't send it, we default to 1 (still numeric).
     const page = Math.max(1, Number(req.query.page ?? 1));
-
-    // Cursor-based paging support (optional param from Vanilla)
     const cursor = (req.query.cursor ?? "").toString();
 
-    // Optional protection: Vanilla must send this header if you set ADAPTER_KEY in Vercel
+    // Optional protection: require x-adapter-key header if ADAPTER_KEY is set
     const incomingKey = req.headers["x-adapter-key"];
     if (process.env.ADAPTER_KEY && incomingKey !== process.env.ADAPTER_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const HELP_BASE = (process.env.HELP_CENTER_BASE_URL ?? "https://help.responsive.io").replace(/\/+$/, "");
+    const HELP_BASE = (process.env.HELP_CENTER_BASE_URL ?? "https://help.responsive.io")
+      .replace(/\/+$/, "");
 
-    // ---- DevRev auth/header ----
     const headers = {
       Authorization: `Bearer ${process.env.DEVREV_TOKEN}`,
       "Content-Type": "application/json",
     };
 
-    // ---- 1) Fetch the page of results we will RETURN to Vanilla ----
+    // ---- 1) Fetch page of results from DevRev search.core ----
     const pageBody = {
       query: q,
       namespaces: ["article"],
@@ -47,8 +42,8 @@ export default async function handler(req, res) {
 
     const pageJson = await pageResp.json();
 
-    // ---- 2) Compute COUNT of matches for THIS QUERY (cursor-walk) ----
-    // Because search.core doesn't return a total-match count, we iterate using next_cursor.
+    // ---- 2) Compute total matches for this query (cursor-walk) ----
+    // search.core doesn't provide total count, so we walk next_cursor and sum results.length.
     const MAX_PAGES_TO_COUNT = Number(process.env.MAX_PAGES_TO_COUNT ?? 50);
     const COUNT_PAGE_SIZE = Math.min(Number(process.env.COUNT_PAGE_SIZE ?? 50), 100);
 
@@ -81,27 +76,25 @@ export default async function handler(req, res) {
       loops += 1;
     }
 
-    // ---- 3) Map DevRev hits -> Vanilla results ----
-    // Excerpt is NOT required, so we omit it.
-    // URL should use external_reference (customer-facing URL), fallback to help.responsive.io.
+    // ---- 3) Map results to Vanilla format ----
+    // URL is in article.sync_metadata.external_reference (per your sample response).
     const mappedResults = (pageJson.results ?? []).map((hit) => {
-      const article = hit.article ?? hit;
+      const article = hit?.article ?? {};
 
-      const title =
-        article.title ??
-        article.display_name ??
-        article.name ??
-        "Help Center Article";
+      const title = article.title ?? "Help Center Article";
 
+      const externalRef = article?.sync_metadata?.external_reference ?? null;
+
+      // Only return customer-facing Responsive help center URLs; otherwise fall back.
       const url =
-        hit.external_reference ??
-        article.external_reference ??
-        HELP_BASE;
+        typeof externalRef === "string" && externalRef.startsWith(HELP_BASE)
+          ? externalRef
+          : HELP_BASE;
 
       return { title, url };
     });
 
-    // ---- 4) Return Vanilla-style response including current page number ----
+    // ---- 4) Return response to Vanilla including numeric currentPage ----
     return res.status(200).json({
       results: {
         count: Number.isFinite(total) ? total : 0,
