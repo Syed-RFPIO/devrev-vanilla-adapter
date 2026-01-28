@@ -1,53 +1,35 @@
 export default async function handler(req, res) {
   try {
-    // ---- Inputs ----
     const q = (req.query.q ?? req.query.query ?? "").toString();
     const perPage = Math.min(Number(req.query.perPage ?? 10), 50);
     const page = Math.max(1, Number(req.query.page ?? 1));
     const cursor = (req.query.cursor ?? "").toString();
 
-    // Auth header (optional)
+    // auth (optional)
     const incomingKey = req.headers["x-adapter-key"];
     if (process.env.ADAPTER_KEY && incomingKey !== process.env.ADAPTER_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Base help center used as fallback
     const HELP_BASE = (process.env.HELP_CENTER_BASE_URL ?? "https://help.responsive.io").replace(/\/+$/, "");
 
-    // Build absolute base URL for this adapter using request headers (so we return full URLs)
+    // adapter base detection for building absolute pager URLs
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0];
     const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const adapterBase = host ? `${proto}://${host}` : (process.env.ADAPTER_BASE_URL ?? null);
-    // If ADAPTER_BASE_URL env var is set (optional), use it as a fallback.
-    const ADAPTER_BASE = adapterBase ?? process.env.ADAPTER_BASE_URL ?? null;
-    if (!ADAPTER_BASE) {
-      // We still proceed, but next/previous will be null to avoid malformed URLs.
-      console.warn("Adapter base URL not detected; you may want to set ADAPTER_BASE_URL env var.");
-    }
+    const ADAPTER_BASE = (host ? `${proto}://${host}` : (process.env.ADAPTER_BASE_URL ?? null)) ?? null;
 
     const headers = {
       Authorization: `Bearer ${process.env.DEVREV_TOKEN}`,
       "Content-Type": "application/json",
     };
 
-    // Helper: determine if an article is archived (robust - checks several common fields)
-    const isArchived = (articleObj) => {
-      if (!articleObj || typeof articleObj !== "object") return false;
-      const lowerKeys = (obj, k) => obj && obj[k];
-      // Common fields across tenants:
-      if (articleObj.is_archived === true) return true;
-      if (articleObj.archived === true) return true;
-      if (articleObj.status && String(articleObj.status).toLowerCase() === "archived") return true;
-      // sync_metadata or sync unit flags (some tenants embed archive info here)
-      if (articleObj.sync_metadata?.is_archived === true) return true;
-      if (articleObj.sync_metadata?.last_sync_in?.sync_unit?.is_archived === true) return true;
-      // resource-level archived flag
-      if (articleObj.resource?.is_archived === true) return true;
-      return false;
+    // helper: true if this article has a Responsive Help Center URL we want to expose
+    const hasResponsiveExternalRef = (articleObj) => {
+      const ext = articleObj?.sync_metadata?.external_reference;
+      return typeof ext === "string" && ext.startsWith(HELP_BASE);
     };
 
-    // ---- 1) Fetch page of results that we'll return ----
+    // 1) fetch page of results (the page we'll return)
     const pageBody = { query: q, namespaces: ["article"], limit: perPage, mode: "after" };
     if (cursor) pageBody.cursor = cursor;
 
@@ -62,7 +44,7 @@ export default async function handler(req, res) {
     }
     const pageJson = await pageResp.json();
 
-    // ---- 2) Compute total matches for this query (cursor-walk) but ONLY count non-archived items ----
+    // 2) Count only items that have a valid Responsive external_reference
     const MAX_PAGES_TO_COUNT = Number(process.env.MAX_PAGES_TO_COUNT ?? 50);
     const COUNT_PAGE_SIZE = Math.min(Number(process.env.COUNT_PAGE_SIZE ?? 50), 100);
 
@@ -83,11 +65,10 @@ export default async function handler(req, res) {
       if (!r.ok) break;
       const j = await r.json();
 
-      // Sum only non-archived results
       const pageCount = Array.isArray(j.results)
         ? j.results.reduce((acc, item) => {
             const articleObj = item?.article ?? item;
-            return acc + (isArchived(articleObj) ? 0 : 1);
+            return acc + (hasResponsiveExternalRef(articleObj) ? 1 : 0);
           }, 0)
         : 0;
 
@@ -98,28 +79,21 @@ export default async function handler(req, res) {
       loops += 1;
     }
 
-    // ---- 3) Map and FILTER results for the page we return (exclude archived items) ----
+    // 3) Map + FILTER page results to include only Responsive external links
     const mappedResults = (pageJson.results ?? [])
       .map((hit) => {
         const article = hit?.article ?? {};
-        if (isArchived(article)) return null; // filter out archived
+        if (!hasResponsiveExternalRef(article)) return null;
 
         const title = article.title ?? article.display_name ?? article.name ?? "Help Center Article";
-
-        // Use sync_metadata.external_reference if present (per sample)
-        const externalRef = article?.sync_metadata?.external_reference ?? null;
-
-        // Accept customer-facing URL only if it starts with HELP_BASE (avoid other-brand links).
-        const url = typeof externalRef === "string" && externalRef.startsWith(HELP_BASE) ? externalRef : HELP_BASE;
-
+        const url = article.sync_metadata.external_reference;
         return { title, url };
       })
       .filter(Boolean);
 
-    // ---- 4) Build absolute next/previous URLs that Vanilla can call ----
+    // 4) Build absolute next/previous URLs for Vanilla to call (Vanilla expects full URLs)
     const makePagerUrl = (cursorToken, nextPageNumber) => {
       if (!cursorToken || !ADAPTER_BASE) return null;
-      // include q, perPage, page (so adapter can return currentPage if called directly)
       const params = new URLSearchParams();
       if (q) params.set("q", q);
       params.set("perPage", String(perPage));
@@ -131,7 +105,7 @@ export default async function handler(req, res) {
     const nextUrl = pageJson.next_cursor ? makePagerUrl(pageJson.next_cursor, page + 1) : null;
     const prevUrl = pageJson.prev_cursor ? makePagerUrl(pageJson.prev_cursor, Math.max(1, page - 1)) : null;
 
-    // ---- 5) Return Vanilla-style response ----
+    // 5) Return response
     return res.status(200).json({
       results: {
         count: Number.isFinite(total) ? total : 0,
