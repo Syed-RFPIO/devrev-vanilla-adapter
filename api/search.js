@@ -1,33 +1,32 @@
-// search.js - supports header OR query param adapter_key; adds CORS; appends adapter_key to pager URLs
+// debug-search-fixed.js - temporary: returns error.stack when you call ?debug=1
 export default async function handler(req, res) {
-  try {
-    // --- CORS: respond to preflight immediately and add headers on all responses ---
-    const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*"; // tighten later to your community origin
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type,Authorization,x-adapter-key",
-      "Access-Control-Max-Age": "600",
-    };
-    // OPTIONS preflight
-    if (req.method === "OPTIONS") {
-      return res.status(204).set(corsHeaders).send("");
-    }
+  // Basic CORS preflight handling
+  const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization,x-adapter-key",
+    "Access-Control-Max-Age": "600",
+  };
+  if (req.method === "OPTIONS") {
+    return res.status(204).set(corsHeaders).send("");
+  }
 
-    // Set CORS headers for the response (will be merged into the result)
-    // We'll apply them at the end via res.set
+  const debugMode = (req.query.debug ?? "").toString() === "1";
+
+  try {
     // --- Inputs ---
     const q = (req.query.q ?? req.query.query ?? "").toString();
     const perPage = Math.min(Number(req.query.perPage ?? 10), 50);
     const page = Math.max(1, Number(req.query.page ?? 1));
     const cursor = (req.query.cursor ?? "").toString();
 
-    // --- Adapter auth: accept header OR query param ---
+    // adapter auth: we accept header OR query param
     const incomingHeaderKey = req.headers["x-adapter-key"];
     const incomingQueryKey = (req.query.adapter_key ?? "").toString();
+    // <-- FIX: define configuredKey so makePagerUrl can reference it safely
     const configuredKey = process.env.ADAPTER_KEY ?? "";
 
-    // If ADAPTER_KEY is set, require either header or query param to match
     if (configuredKey) {
       if (!(incomingHeaderKey === configuredKey || incomingQueryKey === configuredKey)) {
         res.set(corsHeaders);
@@ -37,7 +36,7 @@ export default async function handler(req, res) {
 
     const HELP_BASE = (process.env.HELP_CENTER_BASE_URL ?? "https://help.responsive.io").replace(/\/+$/, "");
 
-    // adapter base detection or fallback to env var
+    // ADAPTER_BASE detection w/ safe fallback
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0];
     const host = req.headers["x-forwarded-host"] || req.headers.host;
     const ADAPTER_BASE = (host ? `${proto}://${host}` : (process.env.ADAPTER_BASE_URL ?? null)) ?? null;
@@ -53,7 +52,7 @@ export default async function handler(req, res) {
       return typeof ext === "string" && ext.startsWith(HELP_BASE);
     };
 
-    // 1) fetch page
+    // --- Fetch page from DevRev ---
     const pageBody = { query: q, namespaces: ["article"], limit: perPage, mode: "after" };
     if (cursor) pageBody.cursor = cursor;
 
@@ -62,14 +61,19 @@ export default async function handler(req, res) {
       headers,
       body: JSON.stringify(pageBody),
     });
+
     if (!pageResp.ok) {
       const txt = await pageResp.text();
       res.set(corsHeaders);
+      if (debugMode) {
+        return res.status(pageResp.status).json({ error: "DevRev error", status: pageResp.status, body: txt });
+      }
       return res.status(pageResp.status).send(txt);
     }
+
     const pageJson = await pageResp.json();
 
-    // 2) count only items with responsive external_reference
+    // --- Count only responsive external_reference results (cursor-walk) ---
     const MAX_PAGES_TO_COUNT = Number(process.env.MAX_PAGES_TO_COUNT ?? 50);
     const COUNT_PAGE_SIZE = Math.min(Number(process.env.COUNT_PAGE_SIZE ?? 50), 100);
 
@@ -104,7 +108,7 @@ export default async function handler(req, res) {
       loops += 1;
     }
 
-    // 3) map + filter page results
+    // --- Map and filter page results ---
     const mappedResults = (pageJson.results ?? [])
       .map((hit) => {
         const article = hit?.article ?? {};
@@ -115,7 +119,7 @@ export default async function handler(req, res) {
       })
       .filter(Boolean);
 
-    // 4) build next/prev full urls and append adapter_key if configured (so Vanilla front-end can call them)
+    // --- Build next/previous full URLs w/ adapter_key if configured ---
     const makePagerUrl = (cursorToken, nextPageNumber) => {
       if (!cursorToken || !ADAPTER_BASE) return null;
       const params = new URLSearchParams();
@@ -123,7 +127,6 @@ export default async function handler(req, res) {
       params.set("perPage", String(perPage));
       params.set("page", String(nextPageNumber ?? page + 1));
       params.set("cursor", cursorToken);
-      // append adapter_key to the query string if configured so vanilla front-end calls will be authorized
       if (configuredKey) params.set("adapter_key", configuredKey);
       return `${ADAPTER_BASE.replace(/\/+$/, "")}/api/search?${params.toString()}`;
     };
@@ -131,7 +134,6 @@ export default async function handler(req, res) {
     const nextUrl = pageJson.next_cursor ? makePagerUrl(pageJson.next_cursor, page + 1) : null;
     const prevUrl = pageJson.prev_cursor ? makePagerUrl(pageJson.prev_cursor, Math.max(1, page - 1)) : null;
 
-    // 5) return response with CORS headers
     res.set(corsHeaders);
     return res.status(200).json({
       results: {
@@ -143,14 +145,19 @@ export default async function handler(req, res) {
         results: mappedResults,
       },
     });
-  } catch (e) {
+  } catch (err) {
     // ensure CORS headers even on error
     const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
-    res.set({
+    const errCors = {
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
       "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type,Authorization,x-adapter-key",
-    });
-    return res.status(500).json({ error: e?.message ?? "Server error" });
+    };
+    res.set(errCors);
+    if (debugMode) {
+      return res.status(500).json({ error: String(err?.message ?? "Server error"), stack: err?.stack ?? null });
+    } else {
+      return res.status(500).json({ error: "Server error" });
+    }
   }
 }
